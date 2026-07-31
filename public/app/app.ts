@@ -392,3 +392,5 @@ function initExtensions() {
 }
 
 export default new GrafanaApp();
+
+// CI evaluation touch; drop before merge
