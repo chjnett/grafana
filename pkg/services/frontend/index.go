@@ -16,6 +16,7 @@ import (
 
 	"github.com/grafana/grafana-app-sdk/logging"
 	"github.com/grafana/grafana/pkg/api/dtos"
+	"github.com/grafana/grafana/pkg/api/webassets"
 	"github.com/grafana/grafana/pkg/services/contexthandler"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
@@ -32,8 +33,11 @@ type IndexProvider struct {
 	hooksService *hooks.HooksService
 	config       *setting.Cfg
 	license      licensing.Licensing
-	bootScript   template.JS
 	previewCfg   fswebassets.PreviewAssetsConfig
+
+	// bootScripts holds boot.js per frontend build directory. The rspack rollout is
+	// per tenant, so the script is picked per request rather than read once.
+	bootScripts map[string]template.JS
 }
 
 type IndexViewData struct {
@@ -102,9 +106,9 @@ func NewIndexProvider(cfg *setting.Cfg, license licensing.Licensing, hooksServic
 		return nil, fmt.Errorf("missing index template")
 	}
 
-	bootScriptRaw, err := os.ReadFile(filepath.Join(cfg.StaticRootPath, "build", "boot.js"))
+	bootScripts, err := readBootScripts(cfg.StaticRootPath)
 	if err != nil {
-		return nil, fmt.Errorf("read boot.js: %w", err)
+		return nil, err
 	}
 
 	logger := logging.DefaultLogger.With("logger", "index-provider")
@@ -119,9 +123,30 @@ func NewIndexProvider(cfg *setting.Cfg, license licensing.Licensing, hooksServic
 		config:       cfg,
 		license:      license,
 		previewCfg:   previewCfg,
-		//nolint:gosec
-		bootScript: template.JS(bootScriptRaw),
+		bootScripts:  bootScripts,
 	}, nil
+}
+
+// readBootScripts loads boot.js for each frontend build directory. The webpack build
+// is required; the rspack build is optional because it only exists once the frontend
+// is built with rspack, which lags the grafana.rspackBuild flag.
+func readBootScripts(staticRootPath string) (map[string]template.JS, error) {
+	//nolint:gosec
+	webpackBoot, err := os.ReadFile(filepath.Join(staticRootPath, webassets.WebpackBuildDir, "boot.js"))
+	if err != nil {
+		return nil, fmt.Errorf("read boot.js: %w", err)
+	}
+
+	//nolint:gosec
+	scripts := map[string]template.JS{webassets.WebpackBuildDir: template.JS(webpackBoot)}
+
+	//nolint:gosec
+	if rspackBoot, err := os.ReadFile(filepath.Join(staticRootPath, webassets.RspackBuildDir, "boot.js")); err == nil {
+		//nolint:gosec
+		scripts[webassets.RspackBuildDir] = template.JS(rspackBoot)
+	}
+
+	return scripts, nil
 }
 
 func (p *IndexProvider) HandleRequest(writer http.ResponseWriter, request *http.Request) {
@@ -140,7 +165,16 @@ func (p *IndexProvider) HandleRequest(writer http.ResponseWriter, request *http.
 		return
 	}
 
-	assetsManifest, previewFolder, err := p.resolveAssets(ctx, request)
+	buildDir := webassets.BuildDir(ctx)
+
+	bootScript, ok := p.bootScripts[buildDir]
+	if !ok {
+		p.log.Error("no boot script for build dir", "buildDir", buildDir)
+		http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	assetsManifest, previewFolder, err := p.resolveAssets(ctx, request, buildDir)
 	if err != nil {
 		p.log.Error("unable to get web assets", "err", err)
 		http.Error(writer, "Internal Server Error", http.StatusInternalServerError)
@@ -183,7 +217,7 @@ func (p *IndexProvider) HandleRequest(writer http.ResponseWriter, request *http.
 		MeticulousAIProductionEnvironmentFlag: meticulousAIProductionEnvironmentFlag,
 		ReduceBootdataAPI:                     reduceBootdataAPI,
 		NewPreferencesPage:                    newPreferencesPage,
-		BootScript:                            p.bootScript,
+		BootScript:                            bootScript,
 		LegacyAPIMode:                         legacyAPIMode,
 		OFREPRootUrlEnabled:                   ofrepRootUrlEnabled,
 	}
@@ -233,7 +267,7 @@ func (p *IndexProvider) HandleRequest(writer http.ResponseWriter, request *http.
 
 // resolveAssets returns the preview build's assets when a valid preview cookie is
 // present, falling back to the default assets so a stale cookie can't break the page.
-func (p *IndexProvider) resolveAssets(ctx context.Context, req *http.Request) (dtos.EntryPointAssets, string, error) {
+func (p *IndexProvider) resolveAssets(ctx context.Context, req *http.Request, buildDir string) (dtos.EntryPointAssets, string, error) {
 	// The cookie only takes effect on stacks that have opted in.
 	if p.previewCfg.Active(k8srequest.NamespaceValue(ctx)) {
 		if cookie, err := req.Cookie(previewAssetsCookieName); err == nil && cookie.Value != "" {
@@ -246,7 +280,7 @@ func (p *IndexProvider) resolveAssets(ctx context.Context, req *http.Request) (d
 		}
 	}
 
-	assets, err := fswebassets.GetWebAssets(ctx, p.config, p.license)
+	assets, err := fswebassets.GetWebAssets(ctx, p.config, p.license, buildDir)
 	return assets, "", err
 }
 
